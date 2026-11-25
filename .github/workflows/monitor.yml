@@ -1,0 +1,45 @@
+name: Uptime monitor
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  check-health:
+    if: vars.BACKEND_URL != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    env:
+      IMAGE_OWNER_REPO: ${{ github.repository }}
+      BACKEND_URL: ${{ vars.BACKEND_URL }}
+      RENDER_BACKEND_DEPLOY_HOOK: ${{ secrets.RENDER_BACKEND_DEPLOY_HOOK }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # a few retries, because free-tier servers can take ~1 minute to wake up
+      - name: Check /health
+        id: health
+        continue-on-error: true
+        run: bash scripts/wait-for-health.sh "$BACKEND_URL" "" 6
+
+      - if: steps.health.outcome == 'failure'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Roll back to the last stable version
+        if: steps.health.outcome == 'failure'
+        run: |
+          export IMAGE="ghcr.io/${IMAGE_OWNER_REPO,,}/backend"
+          bash scripts/rollback.sh
+
+      # make the run show up red so GitHub emails you
+      - if: steps.health.outcome == 'failure'
+        run: |
+          echo "Backend was unhealthy. Rollback was attempted."
+          exit 1

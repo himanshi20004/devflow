@@ -1,0 +1,142 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend-tests:
+    runs-on: ubuntu-latest
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+    env:
+      MONGO_URI_TEST: mongodb://localhost:27017/devflow_test
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci
+      - run: npm test
+
+  frontend-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+
+  # Builds the backend image on every run (so a broken Dockerfile fails the PR).
+  # It is only pushed to GitHub Container Registry when code lands on main.
+  build-image:
+    needs: [backend-tests, frontend-tests]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.name.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: name
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}/backend" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: ${{ github.event_name == 'push' }}
+          build-args: APP_VERSION=${{ github.sha }}
+          tags: |
+            ${{ steps.name.outputs.image }}:${{ github.sha }}
+            ${{ steps.name.outputs.image }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-backend:
+    # stays skipped until you add the BACKEND_URL repository variable (see README)
+    if: github.event_name == 'push' && vars.BACKEND_URL != ''
+    needs: build-image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ${{ needs.build-image.outputs.image }}
+      BACKEND_URL: ${{ vars.BACKEND_URL }}
+      RENDER_BACKEND_DEPLOY_HOOK: ${{ secrets.RENDER_BACKEND_DEPLOY_HOOK }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy this commit
+        run: curl -fsS -G "$RENDER_BACKEND_DEPLOY_HOOK" --data-urlencode "imgURL=$IMAGE:$GITHUB_SHA" > /dev/null
+
+      - name: Wait until the new version is live and healthy
+        run: bash scripts/wait-for-health.sh "$BACKEND_URL" "$GITHUB_SHA" 40
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Mark this image as the last known good version
+        run: docker buildx imagetools create --tag "$IMAGE:stable" "$IMAGE:$GITHUB_SHA"
+
+  rollback-backend:
+    if: always() && needs.deploy-backend.result == 'failure'
+    needs: [build-image, deploy-backend]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    env:
+      IMAGE: ${{ needs.build-image.outputs.image }}
+      BACKEND_URL: ${{ vars.BACKEND_URL }}
+      RENDER_BACKEND_DEPLOY_HOOK: ${{ secrets.RENDER_BACKEND_DEPLOY_HOOK }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - run: bash scripts/rollback.sh
+
+  # the frontend only goes out once the backend it talks to is confirmed healthy
+  deploy-frontend:
+    needs: deploy-backend
+    runs-on: ubuntu-latest
+    env:
+      RENDER_FRONTEND_DEPLOY_HOOK: ${{ secrets.RENDER_FRONTEND_DEPLOY_HOOK }}
+    steps:
+      - name: Trigger frontend deploy
+        run: curl -fsS "$RENDER_FRONTEND_DEPLOY_HOOK" > /dev/null
